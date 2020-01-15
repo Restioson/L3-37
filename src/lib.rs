@@ -158,52 +158,54 @@ impl<C: ManageConnection + Send> Pool<C> {
     ///
     /// This **does not** implement any timeout functionality. Timeout functionality can be added
     /// by calling `.timeout` on the returned future.
-    pub async fn connection(&self) -> Result<Conn<C>, Error<C::Error>> {
-        {
-            let conns = self.conn_pool.conns.lock().await;
+    pub fn connection(&self) -> impl Future<Output = Result<Conn<C>, Error<C::Error>>> {
+        let self_cloned = self.clone();
 
+        async move {
+            let tmp = self_cloned.conn_pool.clone();
+            let conns = tmp.conns.lock().await;
             debug!("connection: acquired connection lock");
             if let Some(conn) = conns.get() {
                 debug!("connection: connection already in pool and ready to go");
                 return Ok(Conn {
                     conn: Some(conn),
-                    pool: Some(self.clone()),
+                    pool: Some(self_cloned),
                 });
             } else {
                 debug!("connection: try spawn connection");
-                if let Some(conn) = Self::try_spawn_connection(&self, &conns).await {
+                if let Some(conn) = Self::try_spawn_connection(&self_cloned, &conns).await {
                     let conn = conn?;
-                    let this = self.clone();
                     debug!("connection: try spawn connection");
 
                     return Ok(Conn {
                         conn: Some(conn),
-                        pool: Some(this),
+                        pool: Some(self_cloned),
                     });
                 }
             }
+
+            drop(conns);
+
+            // Have the pool notify us of the connection
+            let (tx, rx) = oneshot::channel();
+            debug!("connection: pushing to notify of connection");
+            self_cloned.conn_pool.notify_of_connection(tx);
+
+            // Prepare the future which will wait for a free connection
+            debug!("connection: waiting for connection");
+
+            let conn = rx.await.map_err(|_| {
+                Error::Internal(InternalError::Other(
+                    "Connection channel was closed unexpectedly".into(),
+                ))
+            })?;
+
+            debug!("connection: got connection after waiting");
+            Ok(Conn {
+                conn: Some(conn),
+                pool: Some(self_cloned),
+            })
         }
-
-        // Have the pool notify us of the connection
-        let (tx, rx) = oneshot::channel();
-        debug!("connection: pushing to notify of connection");
-        self.conn_pool.notify_of_connection(tx);
-
-        // Prepare the future which will wait for a free connection
-        let this = self.clone();
-        debug!("connection: waiting for connection");
-
-        let conn = rx.await.map_err(|_| {
-            Error::Internal(InternalError::Other(
-                "Connection channel was closed unexpectedly".into(),
-            ))
-        })?;
-
-        debug!("connection: got connection after waiting");
-        Ok(Conn {
-            conn: Some(conn),
-            pool: Some(this),
-        })
     }
 
     /// Attempt to spawn a new connection. If we're not already over the max number of connections,
